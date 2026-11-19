@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
 
 func issue(key, status string) Issue {
 	var i Issue
@@ -59,5 +64,73 @@ func TestSameHeight(t *testing.T) {
 	m.col, m.row = 1, []int{0, 2} // G's top is lower than any card in lane 0 → last card
 	if got := m.sameHeight(0); got != 3 {
 		t.Fatalf("want D (3), got %d", got)
+	}
+}
+
+func TestApprovals(t *testing.T) {
+	var pr PR
+	if approvals(pr) != "" {
+		t.Fatal("no reviewers should render nothing")
+	}
+	pr.Reviewers = []Reviewer{{"Ada", true}, {"Bob", false}}
+	if got := approvals(pr); !strings.HasPrefix(got, "1/2 approved") || !strings.Contains(got, "· Bob") {
+		t.Fatalf("bad approvals: %q", got)
+	}
+}
+
+func TestFilter(t *testing.T) {
+	for q, want := range map[string]string{" 123 ": "CHK-123", "abc-9": "ABC-9", "login": "", "": "", "CHK-": ""} {
+		if got := ticketKey("chk", q); got != want {
+			t.Fatalf("ticketKey(%q) = %q, want %q", q, got, want)
+		}
+	}
+	titled := func(k, s string) Issue { i := issue(k, "1"); i.Fields.Summary = s; return i }
+	m := model{cfg: Config{Project: "CHK"}, row: []int{0, 0}}
+	m.all = [][]Issue{
+		{titled("CHK-1", "Fix Login page")},
+		{titled("CHK-2", "cleanup"), titled("CHK-42", "Login redirect")},
+	}
+	m.filter("")
+	type step struct {
+		keys  []string
+		shown []string
+	}
+	var tm tea.Model = m
+	for _, st := range []step{
+		{[]string{"/", "l", "o", "g"}, []string{"CHK-1", "CHK-42"}}, // title, case-insensitive, live
+		{[]string{"enter"}, []string{"CHK-1", "CHK-42"}},            // filter sticks
+		{[]string{"/", "backspace", "backspace", "backspace", "4", "2", "enter"}, []string{"CHK-42"}},
+		{[]string{"esc"}, []string{"CHK-1", "CHK-2", "CHK-42"}}, // cleared
+	} {
+		for _, k := range st.keys {
+			tm, _ = tm.(model).key(k)
+		}
+		var shown []string
+		for _, lane := range tm.(model).b.lanes {
+			for _, is := range lane {
+				shown = append(shown, is.Key)
+			}
+		}
+		if strings.Join(shown, ",") != strings.Join(st.shown, ",") {
+			t.Fatalf("after %v: shown %v, want %v", st.keys, shown, st.shown)
+		}
+	}
+	// 42 filtered: cursor hopped out of the now-empty first lane
+	tm, _ = tm.(model).key("/")
+	for _, k := range []string{"4", "2"} {
+		tm, _ = tm.(model).key(k)
+	}
+	if tm.(model).col != 1 {
+		t.Fatal("cursor should move to the lane with the match")
+	}
+	// a number that isn't on the board is fetched from Jira
+	tm, _ = tm.(model).key("esc")
+	tm, _ = tm.(model).key("/")
+	var cmd tea.Cmd
+	for _, k := range []string{"9", "9", "enter"} {
+		tm, cmd = tm.(model).key(k)
+	}
+	if !tm.(model).busy || cmd == nil || tm.(model).query != "" {
+		t.Fatal("expected CHK-99 to be loaded from Jira with the filter cleared")
 	}
 }

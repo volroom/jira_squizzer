@@ -104,7 +104,10 @@ type model struct {
 	detail   *detail
 	scroll   int
 	pendingG bool
-	follow   string // issue key to put the cursor on after the next reload
+	search   *string   // non-nil while typing a "/" ticket search
+	query    string    // active filter on the board
+	all      [][]Issue // unfiltered lanes; b.lanes is the filtered view
+	follow   string    // issue key to put the cursor on after the next reload
 	busy     bool
 	msg      string
 	w, h     int
@@ -180,24 +183,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.msg = msg.err.Error()
 			return m, nil
 		}
-		m.b = msg.b
+		m.b, m.all = msg.b, msg.b.lanes
 		if len(m.row) != len(m.b.lanes) {
 			m.row = make([]int, len(m.b.lanes))
 		}
-		m.col = clamp(m.col, 0, len(m.b.lanes)-1)
-		for i := range m.row {
-			m.row[i] = clamp(m.row[i], 0, len(m.b.lanes[i])-1)
-		}
+		m.filter(m.query)
 		if m.follow == "" {
 			m.msg = ""
 		}
-		for i, lane := range m.b.lanes {
-			for j, is := range lane {
-				if is.Key == m.follow {
-					m.col, m.row[i] = i, j
-				}
-			}
-		}
+		m.focus(m.follow)
 		m.follow = ""
 	case detailMsg:
 		m.busy = false
@@ -219,9 +213,94 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// focus puts the board cursor on key, if it's on the board.
+func (m *model) focus(key string) {
+	for i, lane := range m.b.lanes {
+		for j, is := range lane {
+			if is.Key == key {
+				m.col, m.row[i] = i, j
+			}
+		}
+	}
+}
+
+// ticketKey turns "123" into "PROJ-123" and "abc-9" into "ABC-9"; anything else isn't a key.
+func ticketKey(project, q string) string {
+	q = strings.ToUpper(strings.TrimSpace(q))
+	if !strings.Contains(q, "-") {
+		q = strings.ToUpper(project) + "-" + q
+	}
+	if i := strings.LastIndex(q, "-"); i == len(q)-1 || strings.Trim(q[i+1:], "0123456789") != "" {
+		return ""
+	}
+	return q
+}
+
+// filter shows only tickets whose key or title contain q (case-insensitive).
+func (m *model) filter(q string) {
+	m.query = q
+	q = strings.ToLower(strings.TrimSpace(q))
+	m.b.lanes = make([][]Issue, len(m.all))
+	for i, lane := range m.all {
+		for _, is := range lane {
+			if strings.Contains(strings.ToLower(is.Key+" "+is.Fields.Summary), q) {
+				m.b.lanes[i] = append(m.b.lanes[i], is)
+			}
+		}
+	}
+	for i := range m.row {
+		m.row[i] = clamp(m.row[i], 0, len(m.b.lanes[i])-1)
+	}
+	m.col = clamp(m.col, 0, len(m.b.lanes)-1)
+	if len(m.b.lanes) > 0 && len(m.b.lanes[m.col]) == 0 { // hop to a lane that still has tickets
+		for i, lane := range m.b.lanes {
+			if len(lane) > 0 {
+				m.col = i
+				break
+			}
+		}
+	}
+}
+
+func (m *model) count() (n int) {
+	for _, lane := range m.b.lanes {
+		n += len(lane)
+	}
+	return n
+}
+
 func (m model) key(k string) (tea.Model, tea.Cmd) {
 	if k == "ctrl+c" {
 		return m, tea.Quit
+	}
+	if m.search != nil {
+		q := *m.search
+		switch k {
+		case "esc":
+			m.search, q = nil, ""
+		case "backspace":
+			if q != "" {
+				q = q[:len(q)-1]
+			}
+		case "enter":
+			m.search = nil
+			if key := ticketKey(m.cfg.Project, q); m.count() == 0 && key != "" {
+				// not on the sprint board: clear the filter and open it straight from Jira
+				m.filter("")
+				m.busy, m.msg = true, "loading "+key+"…"
+				return m, m.loadDetail(key)
+			}
+			return m, nil
+		default:
+			if len(k) == 1 || k == " " {
+				q += k
+			}
+		}
+		if m.search != nil {
+			m.search = &q
+		}
+		m.filter(q)
+		return m, nil
 	}
 	g := m.pendingG
 	m.pendingG = false
@@ -261,6 +340,15 @@ func (m model) key(k string) (tea.Model, tea.Cmd) {
 	if k == "r" {
 		m.busy, m.msg = true, "reloading…"
 		return m, m.loadBoard()
+	}
+	if k == "/" {
+		q := m.query
+		m.search, m.msg = &q, ""
+		return m, nil
+	}
+	if k == "esc" && m.query != "" {
+		m.filter("")
+		return m, nil
 	}
 	if len(m.b.lanes) == 0 {
 		return m, nil
@@ -336,12 +424,18 @@ var (
 	prColours = map[string]lipgloss.Color{"OPEN": gbGreen, "MERGED": gbPurple, "DECLINED": gbRed}
 )
 
-const boardHelp = "h/l lane · j/k ticket · gg/G top/bottom · enter open · H/L move ticket · r reload · q quit"
+const boardHelp = "h/l lane · j/k ticket · gg/G top/bottom · enter open · / filter · H/L move ticket · r reload · q quit"
 const detailHelp = "j/k scroll · ctrl+d/u page · gg/G top/bottom · q/esc back"
 
 func (m model) footer(help string) string {
+	if m.search != nil {
+		return msgStyle.Render("/"+*m.search) + faint.Render(fmt.Sprintf("█  %d shown · number or title · enter keep · esc clear", m.count()))
+	}
 	if m.msg != "" {
 		return msgStyle.Render(m.msg)
+	}
+	if m.query != "" && m.detail == nil {
+		return msgStyle.Render(fmt.Sprintf("filter %q · %d shown · / edit · esc clear", m.query, m.count()))
 	}
 	return faint.Render(help)
 }
@@ -384,6 +478,22 @@ func (m model) View() string {
 	return header + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, boxes...) + "\n" + m.footer(boardHelp)
 }
 
+// approvals summarises reviewer approval, e.g. "1/2 approved  ✓ Ada  · Bob".
+func approvals(pr PR) string {
+	if len(pr.Reviewers) == 0 {
+		return ""
+	}
+	n, names := 0, make([]string, len(pr.Reviewers))
+	for i, r := range pr.Reviewers {
+		names[i] = "· " + r.Name
+		if r.Approved {
+			n++
+			names[i] = lipgloss.NewStyle().Foreground(gbGreen).Render("✓ " + r.Name)
+		}
+	}
+	return fmt.Sprintf("%d/%d approved  %s", n, len(names), strings.Join(names, "  "))
+}
+
 func (m model) detailLines() []string {
 	d := m.detail
 	f := d.issue.Fields
@@ -402,6 +512,9 @@ func (m model) detailLines() []string {
 	for _, pr := range d.prs {
 		status := lipgloss.NewStyle().Foreground(prColours[pr.Status]).Render("[" + pr.Status + "]")
 		fmt.Fprintf(&b, "  %s %s %s %s\n    %s\n", status, pr.RepositoryName, pr.ID, pr.Name, faint.Render(pr.URL))
+		if a := approvals(pr); a != "" {
+			b.WriteString("    " + a + "\n")
+		}
 	}
 	desc := strings.ReplaceAll(f.Description, "\r", "")
 	if desc == "" {

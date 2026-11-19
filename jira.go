@@ -86,6 +86,12 @@ type Transition struct {
 
 type PR struct {
 	ID, Name, URL, Status, RepositoryName string
+	Reviewers                             []Reviewer
+}
+
+type Reviewer struct {
+	Name     string
+	Approved bool
 }
 
 func (c *Client) BoardID(project string) (int, error) {
