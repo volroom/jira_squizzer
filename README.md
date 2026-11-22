@@ -34,6 +34,7 @@ go install .        # or: go build
 | `gg` / `G` | top / bottom of lane |
 | `Enter` / `o` | open ticket details and linked PRs |
 | `H` / `L` | move ticket to previous / next lane |
+| `/` | filter tickets by number or title (`Enter` keeps it, `Esc` clears) |
 | `r` | reload |
 | `q` | quit |
 
