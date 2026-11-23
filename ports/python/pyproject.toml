@@ -1,0 +1,20 @@
+[project]
+name = "jira-squizzer"
+version = "0.1.0"
+description = "A terminal UI for a Jira Cloud project's active sprint board"
+requires-python = ">=3.13"
+dependencies = [
+    "textual>=8.2.8",
+]
+
+[project.scripts]
+jira-squizzer = "jira_squizzer.app:main"
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
