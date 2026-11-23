@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -95,6 +96,13 @@ type movedMsg struct {
 	err     error
 }
 
+// grab is the board as it was when "m" picked up a ticket, so esc can put it back.
+type grab struct {
+	lanes [][]Issue
+	col   int
+	row   []int
+}
+
 type model struct {
 	c        *Client
 	cfg      Config
@@ -108,6 +116,7 @@ type model struct {
 	query    string    // active filter on the board
 	all      [][]Issue // unfiltered lanes; b.lanes is the filtered view
 	follow   string    // issue key to put the cursor on after the next reload
+	grab     *grab     // non-nil while carrying a ticket in move mode
 	busy     bool
 	msg      string
 	w, h     int
@@ -156,25 +165,55 @@ func (m model) loadDetail(key string) tea.Cmd {
 	}
 }
 
-func (m model) move(is Issue, target Column) tea.Cmd {
+// move transitions is into lane to (unless to is nil), then ranks it just before or after a neighbour (if one is given).
+func (m model) move(is Issue, to *Column, before, after, lane string) tea.Cmd {
 	c := m.c
 	return func() tea.Msg {
-		ts, err := c.Transitions(is.Key)
-		if err != nil {
-			return movedMsg{err: err}
+		if to != nil {
+			ts, err := c.Transitions(is.Key)
+			if err != nil {
+				return movedMsg{key: is.Key, err: err}
+			}
+			t, ok := findTransition(ts, to.Statuses)
+			if !ok {
+				return movedMsg{key: is.Key, err: fmt.Errorf("%s: no workflow transition into %q", is.Key, to.Name)}
+			}
+			if err := c.Transition(is.Key, t.ID); err != nil {
+				return movedMsg{key: is.Key, err: err}
+			}
 		}
-		t, ok := findTransition(ts, target.Statuses)
-		if !ok {
-			return movedMsg{err: fmt.Errorf("%s: no workflow transition into %q", is.Key, target.Name)}
+		if before != "" || after != "" {
+			if err := c.Rank(is.Key, before, after); err != nil {
+				return movedMsg{key: is.Key, err: err}
+			}
 		}
-		return movedMsg{key: is.Key, to: target.Name, err: c.Transition(is.Key, t.ID)}
+		return movedMsg{key: is.Key, to: lane}
 	}
 }
 
 func (m model) Init() tea.Cmd { return m.loadBoard() }
 
+// clearMsg hides a footer message once it's been up a while, so the keys tip comes back.
+type clearMsg string
+
+// Update wraps update so that any message that settles in the footer clears itself after 5s.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	prev, wasBusy := m.msg, m.busy
+	tm, cmd := m.update(msg)
+	n := tm.(model)
+	if n.msg != "" && !n.busy && (n.msg != prev || wasBusy) {
+		s := n.msg
+		cmd = tea.Batch(cmd, tea.Tick(5*time.Second, func(time.Time) tea.Msg { return clearMsg(s) }))
+	}
+	return n, cmd
+}
+
+func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case clearMsg:
+		if m.msg == string(msg) && !m.busy {
+			m.msg = ""
+		}
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 	case boardMsg:
@@ -201,9 +240,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.msg, m.detail, m.scroll = "", &msg.d, 0
 	case movedMsg:
-		if msg.err != nil {
-			m.busy, m.msg = false, msg.err.Error()
-			return m, nil
+		if msg.err != nil { // reload anyway: the board may be showing a carried ticket, or the move may have half-happened
+			m.msg, m.follow = msg.err.Error(), msg.key
+			return m, m.loadBoard()
 		}
 		m.msg, m.follow = msg.key+" → "+msg.to, msg.key
 		return m, m.loadBoard()
@@ -337,6 +376,9 @@ func (m model) key(k string) (tea.Model, tea.Cmd) {
 	if m.busy {
 		return m, nil
 	}
+	if m.grab != nil {
+		return m.carry(k, g)
+	}
 	if k == "r" {
 		m.busy, m.msg = true, "reloading…"
 		return m, m.loadBoard()
@@ -390,12 +432,93 @@ func (m model) key(k string) (tea.Model, tea.Cmd) {
 		if len(lane) > 0 && t >= 0 && t < len(m.b.cols) {
 			is := lane[m.row[m.col]]
 			m.busy, m.msg = true, "moving "+is.Key+"…"
-			return m, m.move(is, m.b.cols[t])
+			return m, m.move(is, &m.b.cols[t], "", "", m.b.cols[t].Name)
+		}
+	case "m":
+		if len(lane) > 0 {
+			gr := &grab{make([][]Issue, len(m.b.lanes)), m.col, slices.Clone(m.row)}
+			for i, l := range m.b.lanes {
+				gr.lanes[i] = slices.Clone(l)
+			}
+			m.grab, m.msg = gr, ""
 		}
 	}
 	m.col = clamp(m.col, 0, len(m.b.lanes)-1)
 	m.row[m.col] = clamp(m.row[m.col], 0, len(m.b.lanes[m.col])-1)
 	return m, nil
+}
+
+// carry moves the grabbed ticket around the board in memory; enter (or m) sends it to Jira, esc puts it back.
+func (m model) carry(k string, g bool) (tea.Model, tea.Cmd) {
+	c, r := m.col, m.row[m.col]
+	lane := m.b.lanes[c]
+	switch k {
+	case "esc":
+		m.b.lanes, m.col, m.row, m.grab = m.grab.lanes, m.grab.col, m.grab.row, nil
+	case "enter", "m":
+		return m.drop()
+	case "j", "down", "k", "up":
+		t := r + 1
+		if k == "k" || k == "up" {
+			t = r - 1
+		}
+		if t >= 0 && t < len(lane) {
+			lane[r], lane[t] = lane[t], lane[r]
+			m.row[c] = t
+		}
+	case "G":
+		m.place(c, len(lane)-1)
+	case "g":
+		if g {
+			m.place(c, 0)
+		} else {
+			m.pendingG = true
+		}
+	case "h", "left", "l", "right":
+		t := c - 1
+		if k == "l" || k == "right" {
+			t = c + 1
+		}
+		if t >= 0 && t < len(m.b.lanes) {
+			m.place(t, m.sameHeight(t))
+		}
+	}
+	return m, nil
+}
+
+// place moves the grabbed ticket to index i of lane t.
+func (m *model) place(t, i int) {
+	c := m.col
+	is := m.b.lanes[c][m.row[c]]
+	m.b.lanes[c] = slices.Delete(m.b.lanes[c], m.row[c], m.row[c]+1)
+	m.row[c] = clamp(m.row[c], 0, len(m.b.lanes[c])-1)
+	i = clamp(i, 0, len(m.b.lanes[t]))
+	m.b.lanes[t] = slices.Insert(m.b.lanes[t], i, is)
+	m.col, m.row[t] = t, i
+}
+
+// drop sends a carried ticket to Jira: a transition if it changed lane, then a rank next to its new neighbour.
+// With a filter on, the neighbour is the nearest visible ticket, which is still the right place since rank is lane-wide.
+func (m model) drop() (tea.Model, tea.Cmd) {
+	gr := m.grab
+	m.grab = nil
+	lane, r := m.b.lanes[m.col], m.row[m.col]
+	if m.col == gr.col && r == gr.row[gr.col] {
+		return m, nil // put back where it was
+	}
+	var to *Column
+	if m.col != gr.col {
+		to = &m.b.cols[m.col]
+	}
+	var before, after string
+	if r+1 < len(lane) {
+		before = lane[r+1].Key
+	} else if r > 0 {
+		after = lane[r-1].Key
+	}
+	is := lane[r]
+	m.busy, m.msg = true, "moving "+is.Key+"…"
+	return m, m.move(is, to, before, after, m.b.cols[m.col].Name)
 }
 
 // Gruvbox dark palette.
@@ -424,12 +547,15 @@ var (
 	prColours = map[string]lipgloss.Color{"OPEN": gbGreen, "MERGED": gbPurple, "DECLINED": gbRed}
 )
 
-const boardHelp = "h/l lane · j/k ticket · gg/G top/bottom · enter open · / filter · H/L move ticket · r reload · q quit"
+const boardHelp = "h/l lane · j/k ticket · gg/G top/bottom · enter open · / filter · m move · H/L move to lane · r reload · q quit"
 const detailHelp = "j/k scroll · ctrl+d/u page · gg/G top/bottom · q/esc back"
 
 func (m model) footer(help string) string {
 	if m.search != nil {
 		return msgStyle.Render("/"+*m.search) + faint.Render(fmt.Sprintf("█  %d shown · number or title · enter keep · esc clear", m.count()))
+	}
+	if m.grab != nil {
+		return msgStyle.Render("-- MOVE --") + faint.Render("  h/l lane · j/k up/down · gg/G top/bottom · enter drop · esc cancel")
 	}
 	if m.msg != "" {
 		return msgStyle.Render(m.msg)
@@ -472,6 +598,9 @@ func (m model) View() string {
 		st := laneStyle
 		if i == m.col {
 			st = activeSt
+			if m.grab != nil {
+				st = laneStyle.BorderForeground(gbOrange)
+			}
 		}
 		boxes = append(boxes, st.Width(cw+2).Height(ch+1).Render(strings.Join(rows, "\n")))
 	}

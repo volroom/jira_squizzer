@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -188,6 +189,27 @@ func (c *Client) Transitions(key string) ([]Transition, error) {
 func (c *Client) Transition(key, id string) error {
 	body := map[string]any{"transition": map[string]string{"id": id}}
 	return c.do("POST", "/rest/api/2/issue/"+url.PathEscape(key)+"/transitions", body, nil)
+}
+
+// Rank puts key just before the issue before, or if that's empty, just after the issue after.
+func (c *Client) Rank(key, before, after string) error {
+	body := map[string]any{"issues": []string{key}}
+	if before != "" {
+		body["rankBeforeIssue"] = before
+	} else {
+		body["rankAfterIssue"] = after
+	}
+	// 204 with no body on success; 207 with per-issue errors on failure
+	var r struct{ Entries []struct{ Errors []string } }
+	if err := c.do("PUT", "/rest/agile/1.0/issue/rank", body, &r); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	for _, e := range r.Entries {
+		if len(e.Errors) > 0 {
+			return fmt.Errorf("rank %s: %s", key, strings.Join(e.Errors, "; "))
+		}
+	}
+	return nil
 }
 
 // PRs uses the undocumented dev-status API (what Jira's own Development panel calls).

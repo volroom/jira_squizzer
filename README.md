@@ -33,6 +33,7 @@ go install .        # or: go build
 | `j` / `k` | next / previous ticket |
 | `gg` / `G` | top / bottom of lane |
 | `Enter` / `o` | open ticket details and linked PRs |
+| `m` | move mode: carry the ticket with `h`/`l` (lanes), `j`/`k` (up/down), `gg`/`G` (top/bottom), then `Enter` to drop or `Esc` to cancel |
 | `H` / `L` | move ticket to previous / next lane |
 | `/` | filter tickets by number or title (`Enter` keeps it, `Esc` clears) |
 | `r` | reload |
@@ -46,5 +47,6 @@ go install .        # or: go build
 
 ## Notes
 
+- Nothing is sent to Jira until you drop a ticket. A drop then runs a transition if the lane changed and a rank call to put it next to its new neighbour. With a filter on, that's the nearest ticket you can see.
 - Moving a ticket runs the first workflow transition that leads into the target lane. If none exists, or the transition needs fields filled in, the move fails and Jira's error is shown.
 - Linked PRs come from Jira's undocumented dev-status API, the one its Development panel uses.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -132,5 +133,73 @@ func TestFilter(t *testing.T) {
 	}
 	if !tm.(model).busy || cmd == nil || tm.(model).query != "" {
 		t.Fatal("expected CHK-99 to be loaded from Jira with the filter cleared")
+	}
+}
+
+func TestMoveMode(t *testing.T) {
+	m := model{w: 60, h: 40, row: []int{0, 0, 0}}
+	m.b.cols = []Column{{Name: "To Do"}, {Name: "Doing"}, {Name: "Done"}}
+	m.all = [][]Issue{{issue("A", "1"), issue("B", "1")}, {issue("C", "3")}, {}}
+	m.filter("")
+	press := func(m model, keys ...string) (model, tea.Cmd) {
+		var tm tea.Model = m
+		var cmd tea.Cmd
+		for _, k := range keys {
+			tm, cmd = tm.(model).key(k)
+		}
+		return tm.(model), cmd
+	}
+	keys := func(m model) string {
+		var s []string
+		for _, lane := range m.b.lanes {
+			var l []string
+			for _, is := range lane {
+				l = append(l, is.Key)
+			}
+			s = append(s, strings.Join(l, ""))
+		}
+		return strings.Join(s, "|")
+	}
+
+	// carry A across two lanes, then up and down within Doing
+	got, _ := press(m, "m", "l", "l")
+	if keys(got) != "B|C|A" || got.col != 2 {
+		t.Fatalf("after m l l: %s col %d", keys(got), got.col)
+	}
+	got, _ = press(got, "h", "G", "g", "g")
+	if keys(got) != "B|AC|" || got.row[1] != 0 {
+		t.Fatalf("after h G gg: %s row %d", keys(got), got.row[1])
+	}
+	got, _ = press(got, "j")
+	if keys(got) != "B|CA|" || got.row[1] != 1 {
+		t.Fatalf("after j: %s", keys(got))
+	}
+
+	// esc puts everything back
+	back, _ := press(got, "esc")
+	if keys(back) != "AB|C|" || back.col != 0 || back.row[0] != 0 || back.grab != nil {
+		t.Fatalf("esc should restore: %s", keys(back))
+	}
+
+	// enter sends it; dropping where it started sends nothing
+	if got, cmd := press(got, "enter"); !got.busy || cmd == nil || got.grab != nil {
+		t.Fatal("enter should send the move to Jira")
+	}
+	if got, cmd := press(m, "m", "j", "k", "enter"); got.busy || cmd != nil {
+		t.Fatal("no-op drop should not call Jira")
+	}
+}
+
+func TestMessageClears(t *testing.T) {
+	m := model{busy: true, msg: "reloading…"}
+	tm, cmd := m.Update(boardMsg{err: errors.New("boom")})
+	if tm.(model).msg != "boom" || cmd == nil {
+		t.Fatal("a settled message should schedule its own clear")
+	}
+	if tm, _ = tm.Update(clearMsg("older")); tm.(model).msg != "boom" {
+		t.Fatal("a stale clear shouldn't hide a newer message")
+	}
+	if tm, _ = tm.Update(clearMsg("boom")); tm.(model).msg != "" {
+		t.Fatal("message should clear")
 	}
 }
