@@ -1,0 +1,23 @@
+{
+  "name": "jira-squizzer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test 'dist/*.test.js'",
+    "start": "node dist/app.js"
+  },
+  "dependencies": {
+    "chalk": "^6.0.1",
+    "ink": "^8.0.0",
+    "react": "^19.3.1",
+    "string-width": "^8.3.0",
+    "wrap-ansi": "^10.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "typescript": "^7.0.2"
+  }
+}
